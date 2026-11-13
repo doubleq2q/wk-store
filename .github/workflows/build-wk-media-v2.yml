@@ -1,0 +1,205 @@
+# WK Store with its own home tile in Media (instead of taking over the PS5
+# Store tile), with Elf Launcher's tile in Media too.
+#
+# Builds the normal Store ELF (all Store features: power buttons, Elf
+# Launcher seeding, warm AppCache), with these changes only:
+#   - /install creates the WK tile SLKT00001 (wkali_install_app) instead of
+#     remapping the Store tile (store_remap_apply)
+#   - WK tile + companion Elf Launcher tile: applicationCategoryType 65536 (Media)
+#   - bundled Elf Launcher patched the same way (same byte length)
+#   - launcher "payload-manager" only: after the jailbreak the chain sends
+#     payloads/payload.elf (itsPLK ps5-unified-autoloader: ps5_autoloader
+#     autoload.txt from USB or /data, else its built-in Payload Manager)
+#     and Elf Launcher is not started
+# Payloads the public repo does not ship (elfldr, unified autoloader, Elf
+# Launcher, power ELFs) are taken from the official WK Store release ELF.
+#
+# Run: Actions tab -> "Build WK Media" -> Run workflow. The result is in the
+# run's Artifacts section.
+
+name: Build WK Media (Elf Launcher or Payload Manager)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Official WK Store release to take the payloads from
+        default: v1.2.3
+      launcher:
+        description: Started after the jailbreak
+        type: choice
+        options:
+          - elf-launcher
+          - payload-manager
+        default: elf-launcher
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 make cmake ninja-build python3 \
+            python3-pyelftools wget xz-utils pkg-config unzip librsvg2-bin
+          sudo ln -sf /usr/bin/clang-18 /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-18 /usr/bin/clang++
+          sudo ln -sf /usr/bin/ld.lld-18 /usr/bin/ld.lld
+
+      - name: Install PS5 payload SDK + libmicrohttpd
+        run: |
+          wget -q -O /tmp/sdk.zip https://github.com/ps5-payload-dev/sdk/releases/download/v0.45/ps5-payload-sdk.zip
+          sudo unzip -q /tmp/sdk.zip -d /opt
+          sudo chmod -R a+rX /opt/ps5-payload-sdk
+          sudo chmod +x /opt/ps5-payload-sdk/bin/*
+          sudo chown -R "$USER" /opt/ps5-payload-sdk
+          bash build_deps.sh
+
+      - name: Take payloads from the official release ELF
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          VER="${RELEASE#v}"
+          wget -q -O /tmp/official.elf \
+            "https://github.com/X-F1REBALL-X/wk-store/releases/download/${RELEASE}/WK_Store_V${VER}.elf"
+          python3 - /tmp/official.elf <<'PY'
+          import os, struct, sys, zlib
+          from elftools.elf.elffile import ELFFile
+          from elftools.elf.relocation import RelocationSection
+
+          path = sys.argv[1]
+          raw = open(path, "rb").read()
+          elf = ELFFile(open(path, "rb"))
+          segs = [s for s in elf.iter_segments() if s["p_type"] == "PT_LOAD"]
+
+          def v2o(va):
+              for s in segs:
+                  if s["p_vaddr"] <= va < s["p_vaddr"] + s["p_filesz"]:
+                      return va - s["p_vaddr"] + s["p_offset"]
+
+          relocs = {}
+          for sec in elf.iter_sections():
+              if isinstance(sec, RelocationSection):
+                  for r in sec.iter_relocations():
+                      if r["r_info_type"] == 8:
+                          relocs[r["r_offset"]] = r["r_addend"]
+
+          # FileEntry {path, data, size, orig_size, compressed, content_type}
+          files = {}
+          for va, addend in relocs.items():
+              o = v2o(addend)
+              if o is None or raw[o:o + 1] != b"/" or va + 8 not in relocs or va + 32 not in relocs:
+                  continue
+              name = raw[o:raw.find(b"\0", o)].decode()
+              size, orig, comp = struct.unpack_from("<IIB", raw, v2o(va) + 16)
+              d = v2o(relocs[va + 8])
+              blob = raw[d:d + size]
+              files[name] = zlib.decompress(blob, -15) if comp else blob
+
+          wanted = {
+              "payloads/elf-launcher.elf", "payloads/payload.elf", "payloads/poweroff.elf",
+              "payloads/reboot.elf", "payloads/suspend.elf", "shared/elfldr-ps5.elf",
+          }
+          got = set()
+          for name, data in files.items():
+              parts = name.split("/")
+              if len(parts) > 3 and parts[1] == "app" and "/".join(parts[3:]) in wanted:
+                  rel = "/".join(parts[3:])
+                  dest = os.path.join("frontend/autoloader", rel)
+                  os.makedirs(os.path.dirname(dest), exist_ok=True)
+                  open(dest, "wb").write(data)
+                  got.add(rel)
+                  print(f"{rel}: {len(data)} bytes")
+          missing = wanted - got
+          if missing:
+              sys.exit(f"missing in release ELF: {sorted(missing)}")
+          PY
+
+      - name: Media tiles + own tile instead of Store remap
+        run: |
+          set -e
+          # WK tile (SLKT00001) and companion Elf Launcher tile (ELFL00001) -> Media
+          for f in assets/param.json.template assets/companions/elf-launcher/param.json; do
+            sed -i -E 's/"applicationCategoryType": *0,/"applicationCategoryType": 65536,/' "$f"
+            grep -q '"applicationCategoryType": 65536,' "$f"
+          done
+
+          # /install: own WK tile instead of remapping the PS5 Store tile
+          OLD='int err = store_remap_apply() < 0 ? -1 : 0;'
+          [ "$(grep -cF "$OLD" src/http_server.c)" = 1 ]
+          sed -i "s/int err = store_remap_apply() < 0 ? -1 : 0;/int err = wkali_install_app();/" src/http_server.c
+          grep -n "int err = wkali_install_app();" src/http_server.c
+          sed -i "s/Store tile ready/Media tile ready/g" store/store_installer_page.h
+
+          # bundled Elf Launcher -> Media (same byte length, no code moves)
+          python3 - <<'PY'
+          import hashlib, re
+          p = "frontend/autoloader/payloads/elf-launcher.elf"
+          d = open(p, "rb").read()
+          old = b'\n    "applicationCategoryType": 0,'
+          new = b'\n "applicationCategoryType":65536,'
+          assert d.count(old) == 1, "Elf Launcher param.json line not found"
+          d = d.replace(old, new)
+          open(p, "wb").write(d)
+          ver = re.search(rb"APP_VERSION\s*=\s*[\"']([^\"']+)", d).group(1).decode()
+          sha = hashlib.sha256(d).hexdigest()
+          open(p + ".sha256", "w").write(f"v{ver} {sha}\n")
+          print(f"Elf Launcher {ver} -> Media, sha256 {sha}")
+          PY
+          python3 tools/update_elf_launcher_metadata.py
+
+      - name: Payload Manager instead of Elf Launcher
+        if: inputs.launcher == 'payload-manager'
+        run: |
+          python3 - <<'PY'
+          def edit(path, old, new):
+              text = open(path, encoding="utf-8").read()
+              assert text.count(old) == 1, f"{path}: {old!r} found {text.count(old)} times"
+              open(path, "w", encoding="utf-8").write(text.replace(old, new))
+              print(f"{path}: {new.strip()}")
+
+          # the chain sends payload.elf after the jailbreak instead of nothing
+          edit("frontend/autoloader/js/main.js",
+               "if (!W.state.updateOnlyMode && !W.state.pendingSelfUpdate) autoloadName = 'wkal-skip';",
+               "if (!W.state.updateOnlyMode && !W.state.pendingSelfUpdate) autoloadName = 'payload.elf';")
+          # and Elf Launcher is not started from disk afterwards
+          edit("frontend/autoloader/js/launcher.js",
+               "\n    W.launcher.openCompanionPage();\n",
+               "\n    W.uiLog('payload.elf: autoload.txt or Payload Manager', 'info');\n")
+          PY
+
+      - name: Build
+        env:
+          BUILD_TYPE: stable
+        run: |
+          # payload-deps is skipped (-o): its payloads were provided above
+          make -o payload-deps SDK=/opt/ps5-payload-sdk store
+          ls -l WK_Store_V*.elf
+
+      - name: Check the result
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          p = glob.glob("WK_Store_V*.elf")[0]
+          d = open(p, "rb").read()
+          tiles = re.findall(rb'"titleId": "(\w+)",\s*"applicationCategoryType": *(\d+)', d)
+          print(p, tiles)
+          assert (b"SLKT00001", b"65536") in tiles and (b"ELFL00001", b"65536") in tiles
+          PY
+          VER=$(grep -oP 'STORE_VERSION := \K\S+' Makefile)
+          SUFFIX=""
+          if [ "${{ inputs.launcher }}" = payload-manager ]; then SUFFIX="_PM"; fi
+          mkdir -p out
+          cp WK_Store_V*.elf "out/WK_Store_Media${SUFFIX}_V${VER}.elf"
+          cp frontend/autoloader/payloads/elf-launcher.elf out/elf-launcher.elf
+          sha256sum out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wk-store-media-${{ inputs.launcher }}
+          path: out/
